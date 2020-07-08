@@ -24,6 +24,7 @@ import "math/rand"
 import "time"
 import "bytes"
 import "../labgob"
+import "log"
 
 
 //
@@ -41,6 +42,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	Term int
 }
 
 type LogEntry struct {
@@ -48,6 +50,9 @@ type LogEntry struct {
 	Term int
 	Command interface{}
 }
+
+
+type SnapshotState string
 
 //
 // A Go object implementing a single Raft peer.
@@ -79,6 +84,10 @@ type Raft struct {
 
 	applyCh chan ApplyMsg
 	heartbeatChan chan int
+	stepDownCh chan int
+
+	lastIncludedIndex int
+	lastIncludedTerm int
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -121,6 +130,10 @@ func (rf *Raft) HeartbeatReceived() bool {
 	return re
 }
 
+func (rf *Raft) StepDownCh() chan int{
+	return rf.stepDownCh
+}
+
 func (rf *Raft) IsLeader() bool {
 	rf.mu.Lock()
 	re := rf.isLeader
@@ -135,10 +148,19 @@ func (rf *Raft) GetCurrentTerm() int {
 	return re
 }
 
-func (rf *Raft) GetLogLen() int {
-	rf.mu.Lock()
-	re := len(rf.logs)
-	rf.mu.Unlock()
+func (rf *Raft) logLen() int {
+	re := len(rf.logs) + rf.lastIncludedIndex + 1
+	return re
+}
+
+func (rf *Raft) getLog(index int) *LogEntry {
+	if index <= rf.lastIncludedIndex {
+		log.Fatal("trying to access log already witten to snapshot.")
+	}
+	re := &rf.logs[index - rf.lastIncludedIndex - 1]
+	if re.Index != index {
+		log.Fatal("log index mismatch.")
+	}
 	return re
 }
 
@@ -181,8 +203,10 @@ func (rf *Raft) persist() {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
-	DPrintf("%d persisted to index %d \n", rf.me, len(rf.logs) - 1)
+	DPrintfToFile(rf.me,"%d persisted to index %d \n", rf.me, rf.logLen() - 1)
 	e.Encode(rf.logs)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -200,12 +224,16 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var logs []LogEntry
-	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&logs) != nil{
-	  DPrintf("%d readPersist error\n", rf.me)
+	var lastIncludedIndex int
+	var lastIncludedTerm int
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&logs) != nil || d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil {
+	  DPrintfToFile(rf.me, "%d readPersist error\n", rf.me)
 	} else {
 	  rf.currentTerm = currentTerm
 	  rf.votedFor = votedFor
 	  rf.logs = logs
+	  rf.lastIncludedIndex = lastIncludedIndex
+	  rf.lastIncludedTerm = lastIncludedTerm
 	}
 }
 
@@ -239,7 +267,9 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B)
+	DPrintfToFile(rf.me, "raft:%d attempt lock %d \n", rf.me, 1)
 	rf.mu.Lock()
+	DPrintfToFile(rf.me, "raft:%d lock %d \n", rf.me, 1)
 	defer rf.mu.Unlock()
 
 	if args.Term < rf.currentTerm {
@@ -265,14 +295,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	// always reply the current term.
 	reply.Term = rf.currentTerm
-	DPrintf("%d vote for %d for term %d result: %t", rf.me, args.CandidateId, args.Term, reply.VoteGranted)
+	DPrintfToFile(rf.me, "%d vote for %d for term %d result: %t", rf.me, args.CandidateId, args.Term, reply.VoteGranted)
+	DPrintfToFile(rf.me, "raft:%d unlock %d \n", rf.me, 1)
 }
 
 func (rf *Raft) ShouldGrantVote(lastIndex int, lastTerm int) bool {
 	if rf.votedFor != -1 {
 		return false
 	}
-	t := -1
+	t := rf.lastIncludedTerm
 	if len(rf.logs) > 0 {
 		t = rf.logs[len(rf.logs) - 1].Term
 	}
@@ -284,8 +315,12 @@ func (rf *Raft) ShouldGrantVote(lastIndex int, lastTerm int) bool {
 		return false
 	}
 
+	index := rf.lastIncludedIndex
+	if len(rf.logs) > 0 {
+		index = rf.logs[len(rf.logs) - 1].Index
+	}
 	// compare index second if term are same.
-	return lastIndex >= len(rf.logs) - 1
+	return lastIndex >= index
 }
 
 //
@@ -342,7 +377,9 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	//DPrintfToFile(rf.me, "raft:%d attempt lock %d \n", rf.me, 2)
 	rf.mu.Lock()
+	//DPrintfToFile(rf.me, "raft:%d lock %d \n", rf.me, 2)
 	defer rf.mu.Unlock()
 	if args.Term >= rf.currentTerm {
 		// request is valid, so set heartbeat called.
@@ -376,29 +413,34 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// Maybe append this log if it's not a heartbeat.
 	if len(args.Entries) > 0 {
-		DPrintf("server %d received non hb append rpc \n", rf.me)
 		// Compare prev log if exists.
 		if args.PrevLogIndex >= 0 {
-			if args.PrevLogIndex >= len(rf.logs){
+			if args.PrevLogIndex >= rf.logLen() {
 				reply.Success = false
-				reply.NextIndex = len(rf.logs)
-				//DPrintf("%d: prelog match fail, self: %d, other: %d,%d\n", rf.me, len(rf.logs), args.PrevLogTerm, args.PrevLogIndex)
-				// maybe we should commit here as well?
+				reply.NextIndex = rf.logLen()
 				return
 			}
-			if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
-				reply.Success = false
-				nextPrev := args.PrevLogIndex - 1
-				for nextPrev >= 0 && rf.logs[nextPrev].Term ==  rf.logs[args.PrevLogIndex].Term {
-					nextPrev--
+
+			if args.PrevLogIndex == rf.lastIncludedIndex {
+				if args.PrevLogTerm != rf.lastIncludedTerm {
+					log.Fatal("AppendEntries received prev log mismatch with commited SnapShot.")
 				}
-				reply.NextIndex = nextPrev + 1
-				return
+			} else if args.PrevLogIndex < rf.lastIncludedIndex {
+				log.Fatal("AppendEntries try to updated snapshot.")
+			} else {
+				if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+					reply.Success = false
+					nextPrev := args.PrevLogIndex - 1
+					for nextPrev >= 0 && rf.logs[nextPrev].Term ==  rf.logs[args.PrevLogIndex].Term {
+						nextPrev--
+					}
+					reply.NextIndex = nextPrev + 1
+					return
+				}
 			}
 		}
 		rf.logs = rf.logs[0: args.PrevLogIndex + 1]
 		rf.logs = append(rf.logs, args.Entries...)
-		//DPrintf("%d added log %d(%d)\n", rf.me, args.Entry.Index, rf.logs[args.Entry.Index].Command.(int))
 		rf.persist()
 	}
 	reply.Success = true
@@ -408,7 +450,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.commitIndex = args.LeaderCommit
 		rf.ApplyToN(rf.commitIndex)
 	}
-
+	//DPrintfToFile(rf.me, "raft:%d unlock %d \n", rf.me, 2)
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -430,28 +472,32 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	DPrintfToFile(rf.me, "raft:%d attempt lock %d \n", rf.me, 0)
 	rf.mu.Lock()
+	DPrintfToFile(rf.me, "raft:%d lock %d \n", rf.me, 0)
 	defer rf.mu.Unlock()
 	// retrun early if this raft instance is not leader.
 	if !rf.isLeader {
+		DPrintfToFile(rf.me, "raft:%d unlock %d \n", rf.me, 0)
 		return -1, -1, false
 	}
-	DPrintf("start called on %d \n", rf.me)
+	DPrintfToFile(rf.me, "start called on %d \n", rf.me)
 	// start with changing state of leader.
 
-	newLog := LogEntry{Index: len(rf.logs), Term: rf.currentTerm, Command: command}
+	newLog := LogEntry{Index: rf.logLen(), Term: rf.currentTerm, Command: command}
 	term := rf.currentTerm
 	rf.logs = append(rf.logs, newLog)
 	rf.persist()
-	index := len(rf.logs) - 1
+	index := rf.logLen() - 1
 	
 	// queue this log to logChan for each raft peer.
 	for i,_ := range rf.peers {
 		if i == rf.me { continue }
-		DPrintf("%d send %d to logchans %d\n", rf.me, index, i)
+		DPrintfToFile(rf.me, "%d send %d to logchans %d\n", rf.me, index, i)
 		rf.logChans[i] <- index
 	}
 
+	DPrintfToFile(rf.me, "raft:%d unlock %d \n", rf.me, 0)
 	return index , term, true
 }
 
@@ -470,7 +516,9 @@ func (rf *Raft) UpdatePeerIterative(peer int, index int, term int) {
 		nextIndex = next
 	}
 
+	DPrintfToFile(rf.me, "raft:%d attempt lock %d \n", rf.me, 3)
 	rf.mu.Lock()
+	DPrintfToFile(rf.me, "raft:%d lock %d \n", rf.me, 3)
 	defer rf.mu.Unlock()
 
 	if !rf.isLeader {
@@ -482,15 +530,19 @@ func (rf *Raft) UpdatePeerIterative(peer int, index int, term int) {
 	}
 
 	// update commit if possible.
-	if rf.CanCommit(index) && rf.commitIndex < index && rf.logs[index].Term == rf.currentTerm {
+	if rf.CanCommit(index) && rf.commitIndex < index && rf.getLog(index).Term == rf.currentTerm {
 		rf.commitIndex = index
 		rf.ApplyToN(index)
 	}
+	DPrintfToFile(rf.me, "raft:%d unlock %d \n", rf.me, 3)
 }
 
 func (rf *Raft) Append(peer, startIndex, endIndex, term int) (bool, bool, int) {
+	DPrintfToFile(rf.me, "raft:%d attempt lock %d \n", rf.me, 4)
 	rf.mu.Lock()
+	DPrintfToFile(rf.me, "raft:%d lock %d \n", rf.me, 4)
 	if !rf.isLeader || rf.currentTerm != term || rf.killed(){
+		DPrintfToFile(rf.me, "raft:%d unlock %d \n", rf.me, 4)
 		return false, false, 0
 	}
 	request := AppendEntriesArgs{}
@@ -499,25 +551,28 @@ func (rf *Raft) Append(peer, startIndex, endIndex, term int) (bool, bool, int) {
 	// prepare request
 	request.Term = term
 	request.LeaderId = rf.me
-	prevLogTerm := -1
-	if startIndex > 0 {
-		prevLogTerm = rf.logs[startIndex - 1].Term
+	prevLogTerm := rf.lastIncludedTerm
+	if startIndex > rf.lastIncludedIndex + 1 {
+		prevLogTerm = rf.getLog(startIndex - 1).Term
 	}
 	request.PrevLogIndex = startIndex - 1
 	request.PrevLogTerm = prevLogTerm
-	request.Entries = rf.logs[startIndex: endIndex + 1]
+	request.Entries = rf.logs[startIndex - (rf.lastIncludedIndex + 1): endIndex + 1 - (rf.lastIncludedIndex + 1)]
 	request.LeaderCommit = Min(rf.commitIndex, rf.matchIndex[peer])
+	DPrintfToFile(rf.me, "raft:%d unlock %d \n", rf.me, 4)
 	rf.mu.Unlock()
 
 	rpcSuccess := false
 	for !rpcSuccess && rf.IsLeader() && !rf.killed(){
-		//DPrintf("%d send rpc applyonece to %d for index %d\n", rf.me, peer, prevLogIndex + 1)
+		//DPrintfToFile(rf.me, "%d send rpc applyonece to %d for index %d\n", rf.me, peer, prevLogIndex + 1)
 		rpcSuccess = rf.sendAppendEntries(peer, &request, &reply)
-		//DPrintf("%d send rpc applyonece to %d for index done %d\n", rf.me, peer, prevLogIndex + 1)
+		//DPrintfToFile(rf.me, "%d send rpc applyonece to %d for index done %d\n", rf.me, peer, prevLogIndex + 1)
 	}
 	
 	// back to follower if reply term > term of this instance
+	DPrintfToFile(rf.me, "raft:%d attempt lock %d \n", rf.me, 5)
 	rf.mu.Lock()
+	DPrintfToFile(rf.me, "raft:%d lock %d \n", rf.me, 5)
 	defer rf.mu.Unlock()
 	if reply.Term > rf.currentTerm {
 		rf.currentTerm = reply.Term
@@ -526,8 +581,10 @@ func (rf *Raft) Append(peer, startIndex, endIndex, term int) (bool, bool, int) {
 		if rf.isLeader {
 			rf.StepDown()
 		}
+		DPrintfToFile(rf.me, "raft:%d unlock %d \n", rf.me, 5)
 		return false, false, 0
 	}
+	DPrintfToFile(rf.me, "raft:%d unlock %d \n", rf.me, 5)
 	return reply.Success, true, reply.NextIndex
 }
 
@@ -555,7 +612,7 @@ func (rf *Raft) InitLeader() {
 		rf.logChans[i] = make(chan int, 50000)
 	}
 
-	startIndex := len(rf.logs) - 1
+	startIndex := rf.logLen() - 1
 	lStartTerm := rf.currentTerm
 
 	for i,_ := range rf.peers {
@@ -566,10 +623,10 @@ func (rf *Raft) InitLeader() {
 		go func (peer int, startTerm int) {
 			for idx := range rf.logChans[peer] {
 				if startTerm != rf.GetCurrentTerm() || !rf.IsLeader() || rf.killed(){
-					DPrintf("%d logchan exit because new term start, old term: %d, new term: %d", rf.me, startTerm, rf.GetCurrentTerm())
+					DPrintfToFile(rf.me, "%d logchan exit because new term start, old term: %d, new term: %d", rf.me, startTerm, rf.GetCurrentTerm())
 					break
 				}
-				DPrintf("%d: logchans[%d] received %d\n", rf.me, peer, idx)
+				DPrintfToFile(rf.me, "%d: logchans[%d] received %d\n", rf.me, peer, idx)
 				rf.UpdatePeerIterative(peer, idx, startTerm)
 			}
 		}(i, lStartTerm)
@@ -584,13 +641,16 @@ func (rf *Raft) StepDown() {
 		}
 		close(rf.logChans[i])
 	}
-	DPrintf("%d step down as leader", rf.me)
+	rf.stepDownCh <- 1
+	DPrintfToFile(rf.me, "%d step down as leader", rf.me)
 }
 
 func (rf *Raft) StartElection() {
-	DPrintf("server %d start election\n", rf.me)
+	DPrintfToFile(rf.me, "raft %d start election\n", rf.me)
 	// Increment term, vote for self
+	DPrintfToFile(rf.me, "raft:%d attempt lock %d \n", rf.me, 6)
 	rf.mu.Lock()
+	DPrintfToFile(rf.me, "raft:%d lock %d \n", rf.me, 6)
 	rf.currentTerm = rf.currentTerm + 1
 	rf.votedFor = rf.me
 	rf.persist()
@@ -605,11 +665,12 @@ func (rf *Raft) StartElection() {
 	if len(rf.logs) > 0 {
 		request.LastLogTerm = rf.logs[len(rf.logs) - 1].Term
 	} else {
-		request.LastLogTerm = -1
+		request.LastLogTerm = rf.lastIncludedTerm
 	}
-	request.LastLogIndex = len(rf.logs) - 1
+	request.LastLogIndex = rf.logLen() - 1
 
 	rf.mu.Unlock()
+	DPrintfToFile(rf.me, "raft:%d unlock %d \n", rf.me, 6)
 
 	// send requests and count vote.
 
@@ -626,14 +687,16 @@ func (rf *Raft) StartElection() {
 			rf.sendRequestVote(server, &request, &reply)
 
 			// Routines here need to hold state lock since we are updating instance state.
+			DPrintfToFile(rf.me, "raft:%d attempt lock %d \n", rf.me, 7)
 			rf.mu.Lock()
+			DPrintfToFile(rf.me, "raft:%d lock %d \n", rf.me, 7)
 			defer rf.mu.Unlock()
 			if reply.VoteGranted {
 				vote++
 				if rf.currentTerm == termVoting && vote > len(rf.peers) / 2 && !rf.isLeader {
 					// election succeded, this instance will be new leader.
 					rf.isLeader = true
-					DPrintf("server %d claimed leader \n", rf.me)
+					DPrintfToFile(rf.me, "raft %d claimed leader for term : %d\n", rf.me, termVoting)
 					// send out heartbeat as soon as leader elected.
 
 					// init leader state
@@ -651,6 +714,7 @@ func (rf *Raft) StartElection() {
 				rf.votedFor = -1
 				rf.persist()
 			}
+			DPrintfToFile(rf.me, "raft:%d unlock %d \n", rf.me, 7)
 		}(i)
 	}
 }
@@ -658,14 +722,31 @@ func (rf *Raft) StartElection() {
 // This will apply current logs up to N or current max log index, make sure hold lock when calling this.
 // no locking in this function to avoid double locking.
 func (rf *Raft) ApplyToN(n int) {
-	if n >= len(rf.logs) {
-		n = len(rf.logs) - 1
+	if n >= rf.logLen() {
+		n = rf.logLen() - 1
 	}
 	for rf.lastApplied < n {
 		rf.lastApplied++
-		msg := ApplyMsg{CommandValid: true, Command: rf.logs[rf.lastApplied].Command, CommandIndex: rf.lastApplied}
+		msg := ApplyMsg{CommandValid: true, Command: rf.getLog(rf.lastApplied).Command, CommandIndex: rf.lastApplied, Term: rf.getLog(rf.lastApplied).Term}
+		DPrintfToFile(rf.me, "%d committed %d \n", rf.me, rf.lastApplied)
 		rf.applyCh <- msg
 	}
+}
+
+func (rf *Raft) SnapShot(index int, term int, snapshot []byte) {
+	rf.lastIncludedIndex = index
+	rf.lastIncludedTerm = term
+	rf.logs = rf.logs[index + 1:]
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
+	raftState := w.Bytes()
+	rf.persister.SaveStateAndSnapshot(raftState, snapshot)
 }
 
 //
@@ -688,10 +769,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.heartbeatReceived = false
 	rf.isLeader = false
 	rf.heartbeatChan = make(chan int, 5)
+	rf.stepDownCh = make(chan int, 5)
 	rf.commitIndex = -1
 	rf.lastApplied = -1
 	rf.applyCh = applyCh
-	rf,leaderId = -1
+	rf.leaderId = -1
+	rf.lastIncludedIndex = -1
+	rf.lastIncludedTerm = -1
 
 	// Your initialization code here (2A, 2B, 2C).
 
@@ -705,7 +789,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			rf.heartbeatReceived = false
 			rf.mu.Unlock()
 			t := GetTimeout(int64(rf.me))
-			DPrintf("%d election time out %d \n", rf.me, t)
 			time.Sleep(time.Duration(t) * time.Millisecond)
 			if !rf.HeartbeatReceived() {
 				// start election if this is not leader.
@@ -760,7 +843,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					request.LeaderCommit = Min(rf.commitIndex, rf.matchIndex[server])
 					rf.mu.Unlock()
 
-					DPrintf("%d send hb to%d \n", rf.me, server)
 					rf.sendAppendEntries(server, &request, &reply)
 					// back to follower if reply term > term of this instance
 					rf.mu.Lock()
@@ -783,5 +865,3 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	return rf
 }
-
-
